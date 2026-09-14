@@ -103,37 +103,30 @@ foreach ($required in @($cl, $link, $lib, $arm64Def, $x64Def, $dummy)) {
     }
 }
 
-function Resolve-WindowsSdkLibPaths {
-    # link.exe needs the Windows SDK's arm64ec import libraries (vcruntime /
-    # kernel32 provide __os_arm64x_dispatch_icall for the EC thunks). This
-    # script runs outside vcvars, so locate the SDK explicitly.
-    $kitsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\Lib"
-    if (-not (Test-Path -LiteralPath $kitsRoot)) {
-        throw "Windows SDK library root not found: $kitsRoot"
+function Import-VsDevCmdEnvironment {
+    param([string] $VsRoot)
+
+    # weasel's arm64x wrapper links inside "vsdevcmd.bat -arch=arm64"; this
+    # script runs outside vcvars, so import the same environment (LIB/INCLUDE
+    # with both arm64 and arm64ec MSVC + Windows SDK libraries) into the
+    # current process before invoking link.exe.
+    $vsdevcmd = Join-Path $VsRoot "Common7\Tools\VsDevCmd.bat"
+    if (-not (Test-Path -LiteralPath $vsdevcmd)) {
+        throw "VsDevCmd.bat not found: $vsdevcmd"
     }
 
-    $sdkVersion = Get-ChildItem -Path $kitsRoot -Directory |
-        Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
-        Sort-Object { [version]$_.Name } -Descending |
-        Select-Object -First 1
-    if (-not $sdkVersion) {
-        throw "No versioned Windows SDK found under $kitsRoot"
+    $output = & $env:ComSpec /s /c " `"$vsdevcmd`" -arch=arm64 -host_arch=x64 -no_logo && set" 2>&1 |
+        Where-Object { $_ -match '^[A-Za-z_][A-Za-z0-9_()]*=' }
+    foreach ($entry in $output) {
+        $separator = $entry.IndexOf('=')
+        Set-Item -LiteralPath ("env:" + $entry.Substring(0, $separator)) -Value $entry.Substring($separator + 1)
     }
-
-    $umArm64ec = Join-Path $sdkVersion.FullName "um\arm64ec"
-    $ucrtArm64ec = Join-Path $sdkVersion.FullName "ucrt\arm64ec"
-    $umArm64 = Join-Path $sdkVersion.FullName "um\arm64"
-    $ucrtArm64 = Join-Path $sdkVersion.FullName "ucrt\arm64"
-    foreach ($dir in @($umArm64ec, $ucrtArm64ec, $umArm64, $ucrtArm64)) {
-        if (-not (Test-Path -LiteralPath $dir)) {
-            throw "Windows SDK arm64/arm64ec libraries not found: $dir (install the ARM64 EC libraries via the Windows SDK setup)"
-        }
+    if (-not $env:LIB) {
+        throw "VsDevCmd did not export a LIB environment"
     }
-    Write-Host "Windows SDK: $($sdkVersion.Name)"
-    return @($umArm64ec, $ucrtArm64ec, $umArm64, $ucrtArm64)
 }
 
-$sdkLibPaths = Resolve-WindowsSdkLibPaths
+Import-VsDevCmdEnvironment -VsRoot $VsRoot
 
 $workDir = Join-Path $OutputDir "obj"
 New-Item -ItemType Directory -Path $workDir -Force | Out-Null
@@ -163,10 +156,10 @@ Invoke-Tool -FilePath $lib -ArgumentList @(
 ) -WorkingDirectory $workDir
 
 $outDll = Join-Path $OutputDir "MoqiTextServiceARM64X.dll"
-# The EC thunks reference __os_arm64x_dispatch_icall from the SDK's arm64ec
-# import libraries, so keep the default libraries and add the SDK lib paths
-# explicitly (this script runs outside vcvars).
-$linkArgs = @(
+# Default libraries stay enabled: the EC thunks reference
+# __os_arm64x_dispatch_icall from the arm64/arm64ec libraries, resolved via
+# the LIB paths imported from VsDevCmd above (same setup as weasel).
+Invoke-Tool -FilePath $link -ArgumentList @(
     "/dll", "/noentry", "/machine:arm64x",
     "/defArm64Native:$arm64Def",
     "/def:$x64Def",
@@ -176,11 +169,7 @@ $linkArgs = @(
     (Join-Path $workDir 'MoqiTextService_x64.lib'),
     (Join-Path $workDir 'MoqiTextService_arm64.lib'),
     "/ignore:4104"
-)
-foreach ($libPath in $sdkLibPaths) {
-    $linkArgs += "/libpath:$libPath"
-}
-Invoke-Tool -FilePath $link -ArgumentList $linkArgs -WorkingDirectory $workDir
+) -WorkingDirectory $workDir
 
 if (-not (Test-Path -LiteralPath $outDll)) {
     throw "ARM64X forwarder DLL was not produced: $outDll"
