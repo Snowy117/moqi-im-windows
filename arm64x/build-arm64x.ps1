@@ -131,8 +131,11 @@ Invoke-Tool -FilePath $lib -ArgumentList @(
 ) -WorkingDirectory $workDir
 
 $outDll = Join-Path $OutputDir "MoqiTextServiceARM64X.dll"
+# /nodefaultlib: the forwarder contains only linker-generated thunks and no
+# CRT dependency, and this script runs outside vcvars where libcmt.lib would
+# not be found.
 Invoke-Tool -FilePath $link -ArgumentList @(
-    "/dll", "/noentry", "/machine:arm64x",
+    "/dll", "/noentry", "/nodefaultlib", "/machine:arm64x",
     "/defArm64Native:$arm64Def",
     "/def:$x64Def",
     "/out:$outDll",
