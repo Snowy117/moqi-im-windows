@@ -3,6 +3,11 @@
 .SYNOPSIS
   One-click build for moqi-ime backend, moqi-im-windows binaries, and installer package.
 
+.DESCRIPTION
+  Builds the moqi-ime backend twice (x64 for Intel/AMD machines and ARM64 for
+  Windows on ARM) plus the Win32/x64/ARM64 moqi-im-windows binaries, then
+  produces a single installer that covers all architectures.
+
 .PARAMETER RepoRoot
   Root of moqi-im-windows (defaults to the parent directory of this script).
 
@@ -15,6 +20,9 @@
 .PARAMETER Generator
   CMake generator for moqi-im-windows (default: Visual Studio 17 2022).
 
+.PARAMETER SkipArm64
+  Skip all ARM64 builds and produce an x64/x86-only installer.
+
 .PARAMETER ProtobufRoot
   Optional local protobuf/protoc install root forwarded to scripts\build.ps1.
 
@@ -26,6 +34,7 @@ param(
     [string] $MoqiImeRoot = "",
     [string] $Configuration = "Release",
     [string] $Generator = "Visual Studio 17 2022",
+    [switch] $SkipArm64,
     [string] $ProtobufRoot = "",
     [string] $ProtobufSourceDir = ""
 )
@@ -66,7 +75,6 @@ $MoqiImeRoot = [System.IO.Path]::GetFullPath($MoqiImeRoot)
 $moqiImeBuildScript = Join-Path $MoqiImeRoot "scripts\build.ps1"
 $windowsBuildScript = Join-Path $RepoRoot "scripts\build.ps1"
 $windowsInstallScript = Join-Path $RepoRoot "scripts\install.ps1"
-$moqiImeRuntimeDir = Join-Path $MoqiImeRoot "scripts\build\moqi-ime"
 
 if (-not $ProtobufRoot) {
     $candidatePaths = @()
@@ -118,7 +126,22 @@ foreach ($path in @($moqiImeBuildScript, $windowsBuildScript, $windowsInstallScr
     }
 }
 
-Write-Host "== Step 1/3: Build moqi-ime runtime =="
+if ($SkipArm64) {
+    Write-Host "== Step 1/3: Build moqi-ime runtime (x64) =="
+} else {
+    Write-Host "== Step 1/3: Build moqi-ime runtime (x64 + ARM64) =="
+}
+
+$moqiImeBuildDir = Join-Path $MoqiImeRoot "scripts\build\moqi-ime"
+$moqiImeAmd64Dir = Join-Path $MoqiImeRoot "scripts\build\moqi-ime-amd64"
+$moqiImeArm64Dir = Join-Path $MoqiImeRoot "scripts\build\moqi-ime-arm64"
+
+foreach ($dir in @($moqiImeAmd64Dir, $moqiImeArm64Dir)) {
+    if (Test-Path -LiteralPath $dir) {
+        Remove-Item -LiteralPath $dir -Recurse -Force
+    }
+}
+
 Invoke-Step -FilePath "powershell.exe" -ArgumentList @(
     "-NoProfile",
     "-ExecutionPolicy", "Bypass",
@@ -126,12 +149,47 @@ Invoke-Step -FilePath "powershell.exe" -ArgumentList @(
     "-RepoRoot", "`"$MoqiImeRoot`""
 ) -WorkingDirectory $MoqiImeRoot
 
-if (-not (Test-Path -LiteralPath (Join-Path $moqiImeRuntimeDir "server.exe"))) {
-    throw "moqi-ime runtime was not produced: $moqiImeRuntimeDir"
+if (-not (Test-Path -LiteralPath (Join-Path $moqiImeBuildDir "server.exe"))) {
+    throw "moqi-ime runtime was not produced: $moqiImeBuildDir"
+}
+Move-Item -LiteralPath $moqiImeBuildDir -Destination $moqiImeAmd64Dir
+
+if (-not $SkipArm64) {
+    $previousGoarch = $env:GOARCH
+    $env:GOARCH = "arm64"
+    try {
+        Invoke-Step -FilePath "powershell.exe" -ArgumentList @(
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", "`"$moqiImeBuildScript`"",
+            "-RepoRoot", "`"$MoqiImeRoot`""
+        ) -WorkingDirectory $MoqiImeRoot
+    }
+    finally {
+        if ($null -ne $previousGoarch) {
+            $env:GOARCH = $previousGoarch
+        } else {
+            Remove-Item -LiteralPath 'env:GOARCH' -ErrorAction SilentlyContinue
+        }
+    }
+
+    $arm64Server = Join-Path $moqiImeBuildDir "server.exe"
+    if (-not (Test-Path -LiteralPath $arm64Server)) {
+        throw "ARM64 moqi-ime runtime was not produced: $moqiImeBuildDir"
+    }
+    $serverBytes = [System.IO.File]::ReadAllBytes($arm64Server)
+    $peOffset = [BitConverter]::ToInt32($serverBytes, 0x3C)
+    $serverMachine = [BitConverter]::ToUInt16($serverBytes, $peOffset + 4)
+    if ($serverMachine -ne 0xAA64) {
+        throw ("ARM64 moqi-ime server.exe has unexpected PE machine type 0x{0:X4} (expected 0xAA64); does moqi-ime's build script honor GOARCH?" -f $serverMachine)
+    }
+    Move-Item -LiteralPath $moqiImeBuildDir -Destination $moqiImeArm64Dir
 }
 
+$moqiImeRuntimeDir = $moqiImeAmd64Dir
+
 Write-Host "== Step 2/3: Build moqi-im-windows binaries =="
- $windowsBuildArgs = @(
+$windowsBuildArgs = @(
     "-NoProfile",
     "-ExecutionPolicy", "Bypass",
     "-File", "`"$windowsBuildScript`"",
@@ -139,6 +197,9 @@ Write-Host "== Step 2/3: Build moqi-im-windows binaries =="
     "-Configuration", $Configuration,
     "-Generator", "`"$Generator`""
 )
+if ($SkipArm64) {
+    $windowsBuildArgs += "-SkipArm64"
+}
 if ($ProtobufSourceDir) {
     $windowsBuildArgs += @("-ProtobufSourceDir", "`"$ProtobufSourceDir`"")
 }
@@ -148,13 +209,19 @@ if ($ProtobufRoot) {
 Invoke-Step -FilePath "powershell.exe" -ArgumentList $windowsBuildArgs -WorkingDirectory $RepoRoot
 
 Write-Host "== Step 3/3: Build installer package =="
-Invoke-Step -FilePath "powershell.exe" -ArgumentList @(
+$windowsInstallArgs = @(
     "-NoProfile",
     "-ExecutionPolicy", "Bypass",
     "-File", "`"$windowsInstallScript`"",
     "-RepoRoot", "`"$RepoRoot`"",
     "-MoqiImeSource", "`"$moqiImeRuntimeDir`""
-) -WorkingDirectory $RepoRoot
+)
+if ($SkipArm64) {
+    $windowsInstallArgs += "-SkipArm64"
+} else {
+    $windowsInstallArgs += @("-MoqiImeArm64Source", "`"$moqiImeArm64Dir`"")
+}
+Invoke-Step -FilePath "powershell.exe" -ArgumentList $windowsInstallArgs -WorkingDirectory $RepoRoot
 
 $installerPath = Join-Path $RepoRoot "installer\dist\moqi-im-windows-setup.exe"
 if (Test-Path -LiteralPath $installerPath) {

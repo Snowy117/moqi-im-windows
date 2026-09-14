@@ -1,0 +1,11 @@
+; Export forwarding table for the x64 emulation side of MoqiTextServiceARM64X.dll.
+; The x64 exports must forward to the plain x64 MoqiTextServiceX64.dll placed
+; next to the forwarder in System32 on ARM64 Windows. The x64 DLL itself is
+; never registered; it is only reached through the ARM64X forwarder when an
+; x64 emulation process loads the IME.
+
+EXPORTS
+    DllGetClassObject = MoqiTextServiceX64.dll.DllGetClassObject
+    DllCanUnloadNow   = MoqiTextServiceX64.dll.DllCanUnloadNow
+    DllRegisterServer = MoqiTextServiceX64.dll.DllRegisterServer
+    DllUnregisterServer = MoqiTextServiceX64.dll.DllUnregisterServer

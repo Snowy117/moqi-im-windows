@@ -55,4 +55,8 @@ build-*
 build64-*
 cmake-build-ninja
 
+# arm64x/build-arm64x.ps1 is a source script, not a build output; the build-*
+# rule above would otherwise ignore it (build outputs land in arm64x\build\).
+!arm64x/build-arm64x.ps1
+
 installer/stage

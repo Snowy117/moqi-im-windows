@@ -31,10 +31,26 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      - name: Resolve moqi-ime repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Windows PowerShell wraps native stderr in error records and GitHub
+          # sets $ErrorActionPreference='stop' for this shell, so a failing
+          # gh api probe would abort the step before the fallback applies.
+          $ErrorActionPreference = 'Continue'
+          $repo = "${{ github.repository_owner }}/moqi-ime"
+          gh api "repos/$repo" --silent 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            $repo = "gaboolic/moqi-ime"
+          }
+          Write-Host "Using moqi-ime repository: $repo"
+          "MOQI_IME_REPO=$repo" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Checkout moqi-ime
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/moqi-ime
+          repository: ${{ env.MOQI_IME_REPO }}
           path: moqi-ime
           submodules: recursive
           fetch-depth: 0
@@ -46,7 +62,13 @@ jobs:
           cache-dependency-path: moqi-ime/go.sum
 
       - name: Install Inno Setup
-        run: choco install innosetup --yes --no-progress
+        run: |
+          choco install innosetup --yes --no-progress
+          # ARM64 keywords (ArchitecturesAllowed=arm64, IsARM64) need Inno 6.3+.
+          $iscc = Get-Item "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue
+          if (-not $iscc -or [version]$iscc.VersionInfo.ProductVersion -lt [version]'6.3') {
+            throw "Inno Setup 6.3+ required, found: $($iscc.VersionInfo.ProductVersion)"
+          }
 
       - name: Download protoc
         run: |

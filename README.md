@@ -154,13 +154,21 @@ Windows 侧的职责主要是：
 
 ## 构建
 
-前置：**Visual Studio 2022**、**CMake 3.21+**、Windows SDK。
+前置：**Visual Studio 2022**（含 **MSVC v143 ARM64 生成工具** 组件，用于 Windows ARM64 支持）、**CMake 3.21+**、Windows SDK、**Inno Setup 6.3+**。
 
 在本仓库根目录执行：
 
    `powershell -ExecutionPolicy Bypass -File .\scripts\_all_in_package.ps1`
 
-该脚本会生成安装器：`installer\dist\moqi-im-windows-setup.exe`
+该脚本会：
+
+1. 构建 `moqi-ime` 后端（x64 与 ARM64 两份 `server.exe`，需 Go 1.24+）
+2. 用 CMake 构建 Win32 / x64 / ARM64 三份二进制，并链接 ARM64X 转发 DLL（`arm64x\`）
+3. 生成覆盖全架构的安装器：`installer\dist\moqi-im-windows-setup.exe`
+
+在没有 ARM64 工具链的机器上可以加 `-SkipArm64` 只出 x64/x86 安装器。
+
+Windows ARM64 上的部署方式（参考 [小狼毫](https://github.com/rime/weasel)）：`System32\MoqiTextService.dll` 是一个 ARM64X 转发 DLL，ARM64 原生进程经它加载 `MoqiTextServiceARM64.dll`，x64 模拟进程加载 `MoqiTextServiceX64.dll`，安装时由 `SetupHelper.exe` 一并部署并注册。
 
 ## 参考文档
 

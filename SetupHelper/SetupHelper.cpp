@@ -272,6 +272,70 @@ std::wstring NormalizePathForPendingOperation(const std::wstring& path) {
   return path;
 }
 
+#ifndef IMAGE_FILE_MACHINE_ARM64
+#define IMAGE_FILE_MACHINE_ARM64 0xAA64
+#endif
+
+bool IsArm64Machine() {
+  using IsWow64Process2Fn = BOOL(WINAPI*)(HANDLE, USHORT*, USHORT*);
+  static IsWow64Process2Fn is_wow64_process_2 =
+      reinterpret_cast<IsWow64Process2Fn>(::GetProcAddress(
+          ::GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2"));
+  if (is_wow64_process_2 == nullptr) {
+    return false;
+  }
+  USHORT process_machine = 0;
+  USHORT native_machine = 0;
+  if (!is_wow64_process_2(::GetCurrentProcess(), &process_machine,
+                          &native_machine)) {
+    return false;
+  }
+  return native_machine == IMAGE_FILE_MACHINE_ARM64;
+}
+
+std::wstring GetRealSystem32DirectoryPath() {
+  return (fs::path(GetWindowsDirectoryPath()) / L"System32").wstring();
+}
+
+class Wow64FsRedirectionScope {
+ public:
+  Wow64FsRedirectionScope() {
+    disabled_ = ::Wow64DisableWow64FsRedirection(&previous_value_) == TRUE;
+  }
+
+  ~Wow64FsRedirectionScope() {
+    if (disabled_) {
+      ::Wow64RevertWow64FsRedirection(previous_value_);
+    }
+  }
+
+  Wow64FsRedirectionScope(const Wow64FsRedirectionScope&) = delete;
+  Wow64FsRedirectionScope& operator=(const Wow64FsRedirectionScope&) = delete;
+
+  bool disabled() const { return disabled_; }
+
+ private:
+  PVOID previous_value_ = nullptr;
+  bool disabled_ = false;
+};
+
+struct Arm64SystemTargets {
+  fs::path native_dll;   // System32\MoqiTextServiceARM64.dll
+  fs::path x64_dll;      // System32\MoqiTextServiceX64.dll
+  fs::path forwarder;    // System32\MoqiTextService.dll (ARM64X)
+  fs::path regsvr32;     // System32\regsvr32.exe (native ARM64)
+};
+
+Arm64SystemTargets GetArm64SystemTargets() {
+  const fs::path system32 = fs::path(GetRealSystem32DirectoryPath());
+  Arm64SystemTargets targets;
+  targets.native_dll = system32 / L"MoqiTextServiceARM64.dll";
+  targets.x64_dll = system32 / L"MoqiTextServiceX64.dll";
+  targets.forwarder = system32 / L"MoqiTextService.dll";
+  targets.regsvr32 = system32 / L"regsvr32.exe";
+  return targets;
+}
+
 bool RunProcess(const std::wstring& application_path,
                 std::wstring command,
                 const std::wstring& working_dir,
@@ -671,6 +735,26 @@ bool CopyFileWithFallback(const fs::path& source,
   return false;
 }
 
+bool DeploySystemDll(const fs::path& source,
+                     const fs::path& destination,
+                     bool& reboot_required,
+                     std::wstring* error) {
+  DWORD initial_copy_error = 0;
+  DWORD fallback_error = 0;
+  if (CopyFileWithFallback(source, destination, reboot_required, error,
+                           &initial_copy_error, &fallback_error)) {
+    return true;
+  }
+  if ((initial_copy_error == ERROR_SHARING_VIOLATION ||
+       initial_copy_error == ERROR_ACCESS_DENIED ||
+       fallback_error == ERROR_SHARING_VIOLATION ||
+       fallback_error == ERROR_ACCESS_DENIED) &&
+      ScheduleReplaceOnReboot(source, destination, reboot_required, error)) {
+    return true;
+  }
+  return false;
+}
+
 int ShowFailureAndReturn(const std::wstring& message, const bool silent) {
   ShowMessage(message, L"SetupHelper", MB_ICONERROR | MB_OK, silent);
   return kExitFailure;
@@ -681,22 +765,44 @@ int RunReregister(const Options& options) {
   const fs::path source32 = app_dir / L"MoqiTextService.dll";
   const fs::path source64 = app_dir / L"x64" / L"MoqiTextService.dll";
   const fs::path dest32 = fs::path(GetSyswow64DirectoryPath()) / L"MoqiTextService.dll";
-  const fs::path dest64 = fs::path(GetNativeSystemDirectoryPath()) / L"MoqiTextService.dll";
-  const fs::path dest64_for_regsvr =
-      fs::path(GetNativeSystemDirectoryForChildProcess()) / L"MoqiTextService.dll";
+  const bool is_arm64 = IsArm64Machine();
+  const Arm64SystemTargets arm64_targets = GetArm64SystemTargets();
+  const fs::path dest64 = is_arm64
+      ? arm64_targets.forwarder
+      : fs::path(GetNativeSystemDirectoryPath()) / L"MoqiTextService.dll";
+  const fs::path dest64_for_regsvr = is_arm64
+      ? arm64_targets.forwarder
+      : fs::path(GetNativeSystemDirectoryForChildProcess()) / L"MoqiTextService.dll";
   const fs::path regsvr32 = fs::path(GetSyswow64DirectoryPath()) / L"regsvr32.exe";
-  const fs::path regsvr64 = fs::path(GetNativeSystemDirectoryPath()) / L"regsvr32.exe";
+  const fs::path regsvr64 = is_arm64
+      ? arm64_targets.regsvr32
+      : fs::path(GetNativeSystemDirectoryPath()) / L"regsvr32.exe";
 
   CleanupStaleOldFiles(dest32);
-  CleanupStaleOldFiles(dest64);
   CleanupStaleRebootCopies(source32);
   CleanupStaleRebootCopies(source64);
+  if (!is_arm64) {
+    CleanupStaleOldFiles(dest64);
+  }
 
   if (!RunRegsvr(regsvr32, dest32, app_dir, false)) {
     return ShowFailureAndReturn(L"Failed to register Win32 TSF DLL.",
                                 options.silent);
   }
-  if (!RunRegsvr(regsvr64, dest64_for_regsvr, app_dir, false)) {
+  if (is_arm64) {
+    Wow64FsRedirectionScope redirection_scope;
+    if (!redirection_scope.disabled()) {
+      return ShowFailureAndReturn(L"Failed to register ARM64 TSF DLL.",
+                                  options.silent);
+    }
+    CleanupStaleOldFiles(arm64_targets.forwarder);
+    CleanupStaleOldFiles(arm64_targets.native_dll);
+    CleanupStaleOldFiles(arm64_targets.x64_dll);
+    if (!RunRegsvr(regsvr64, dest64_for_regsvr, app_dir, false)) {
+      return ShowFailureAndReturn(L"Failed to register ARM64 TSF DLL.",
+                                  options.silent);
+    }
+  } else if (!RunRegsvr(regsvr64, dest64_for_regsvr, app_dir, false)) {
     return ShowFailureAndReturn(L"Failed to register x64 TSF DLL.",
                                 options.silent);
   }
@@ -710,12 +816,23 @@ int RunInstall(const Options& options) {
   const fs::path source64 = app_dir / L"x64" / L"MoqiTextService.dll";
   // TSF DLLs must live in system directories, or IME input will not work in
   // some games such as CS2.
+  const bool is_arm64 = IsArm64Machine();
+  const Arm64SystemTargets arm64_targets = GetArm64SystemTargets();
+  const fs::path source_arm64_native =
+      app_dir / L"arm64" / L"MoqiTextService.dll";
+  const fs::path source_arm64_forwarder =
+      app_dir / L"arm64" / L"MoqiTextServiceARM64X.dll";
   const fs::path dest32 = fs::path(GetSyswow64DirectoryPath()) / L"MoqiTextService.dll";
-  const fs::path dest64 = fs::path(GetNativeSystemDirectoryPath()) / L"MoqiTextService.dll";
-  const fs::path dest64_for_regsvr =
-      fs::path(GetNativeSystemDirectoryForChildProcess()) / L"MoqiTextService.dll";
+  const fs::path dest64 = is_arm64
+      ? arm64_targets.forwarder
+      : fs::path(GetNativeSystemDirectoryPath()) / L"MoqiTextService.dll";
+  const fs::path dest64_for_regsvr = is_arm64
+      ? arm64_targets.forwarder
+      : fs::path(GetNativeSystemDirectoryForChildProcess()) / L"MoqiTextService.dll";
   const fs::path regsvr32 = fs::path(GetSyswow64DirectoryPath()) / L"regsvr32.exe";
-  const fs::path regsvr64 = fs::path(GetNativeSystemDirectoryPath()) / L"regsvr32.exe";
+  const fs::path regsvr64 = is_arm64
+      ? arm64_targets.regsvr32
+      : fs::path(GetNativeSystemDirectoryPath()) / L"regsvr32.exe";
 
   if (!fs::exists(source32)) {
     return ShowFailureAndReturn(L"Missing Win32 payload: " + source32.wstring(),
@@ -724,6 +841,14 @@ int RunInstall(const Options& options) {
   if (!fs::exists(source64)) {
     return ShowFailureAndReturn(L"Missing x64 payload: " + source64.wstring(),
                                 options.silent);
+  }
+  if (is_arm64 && (!fs::exists(source_arm64_native) ||
+                   !fs::exists(source_arm64_forwarder))) {
+    return ShowFailureAndReturn(
+        L"This ARM64 machine requires the ARM64 payload under "
+        + (app_dir / L"arm64").wstring() +
+            L", which is missing. Reinstall with a setup built for ARM64.",
+        options.silent);
   }
 
   DeleteReregisterTask();
@@ -734,32 +859,35 @@ int RunInstall(const Options& options) {
 
   bool reboot_required = false;
   std::wstring copy_error;
-  DWORD initial_copy_error = 0;
-  DWORD fallback_error = 0;
-  if (!CopyFileWithFallback(source32, dest32, reboot_required, &copy_error,
-                            &initial_copy_error, &fallback_error)) {
-    if (!((initial_copy_error == ERROR_SHARING_VIOLATION ||
-           initial_copy_error == ERROR_ACCESS_DENIED ||
-           fallback_error == ERROR_SHARING_VIOLATION ||
-           fallback_error == ERROR_ACCESS_DENIED) &&
-          ScheduleReplaceOnReboot(source32, dest32, reboot_required,
-                                  &copy_error))) {
+  if (!DeploySystemDll(source32, dest32, reboot_required, &copy_error)) {
+    return ShowFailureAndReturn(
+        L"Failed to update Win32 TSF DLL in " + dest32.wstring() + L"\n\n" +
+            copy_error,
+        options.silent);
+  }
+
+  if (is_arm64) {
+    // System32\MoqiTextService.dll is the ARM64X forwarder; ARM64 native
+    // processes load MoqiTextServiceARM64.dll through it and x64 emulation
+    // processes load MoqiTextServiceX64.dll. Only the forwarder is registered.
+    Wow64FsRedirectionScope redirection_scope;
+    if (!redirection_scope.disabled()) {
+      return ShowFailureAndReturn(L"Failed to disable WOW64 file system "
+                                  L"redirection for ARM64 deployment.",
+                                  options.silent);
+    }
+    if (!DeploySystemDll(source_arm64_native, arm64_targets.native_dll,
+                         reboot_required, &copy_error) ||
+        !DeploySystemDll(source64, arm64_targets.x64_dll, reboot_required,
+                         &copy_error) ||
+        !DeploySystemDll(source_arm64_forwarder, arm64_targets.forwarder,
+                         reboot_required, &copy_error)) {
       return ShowFailureAndReturn(
-          L"Failed to update Win32 TSF DLL in " + dest32.wstring() + L"\n\n" +
-              copy_error,
+          L"Failed to update ARM64 TSF DLLs in System32.\n\n" + copy_error,
           options.silent);
     }
-  }
-  initial_copy_error = 0;
-  fallback_error = 0;
-  if (!CopyFileWithFallback(source64, dest64, reboot_required, &copy_error,
-                            &initial_copy_error, &fallback_error)) {
-    if (!((initial_copy_error == ERROR_SHARING_VIOLATION ||
-           initial_copy_error == ERROR_ACCESS_DENIED ||
-           fallback_error == ERROR_SHARING_VIOLATION ||
-           fallback_error == ERROR_ACCESS_DENIED) &&
-          ScheduleReplaceOnReboot(source64, dest64, reboot_required,
-                                  &copy_error))) {
+  } else {
+    if (!DeploySystemDll(source64, dest64, reboot_required, &copy_error)) {
       return ShowFailureAndReturn(
           L"Failed to update x64 TSF DLL in " + dest64.wstring() + L"\n\n" +
               copy_error,
@@ -779,7 +907,14 @@ int RunInstall(const Options& options) {
     return ShowFailureAndReturn(L"Failed to register Win32 TSF DLL.",
                                 options.silent);
   }
-  if (!RunRegsvr(regsvr64, dest64_for_regsvr, app_dir, false)) {
+  if (is_arm64) {
+    Wow64FsRedirectionScope redirection_scope;
+    if (!redirection_scope.disabled() ||
+        !RunRegsvr(regsvr64, dest64_for_regsvr, app_dir, false)) {
+      return ShowFailureAndReturn(L"Failed to register ARM64 TSF DLL.",
+                                  options.silent);
+    }
+  } else if (!RunRegsvr(regsvr64, dest64_for_regsvr, app_dir, false)) {
     return ShowFailureAndReturn(L"Failed to register x64 TSF DLL.",
                                 options.silent);
   }
@@ -791,24 +926,53 @@ int RunInstall(const Options& options) {
 
 int RunUninstall(const Options& options) {
   const fs::path app_dir(options.app_dir);
+  const bool is_arm64 = IsArm64Machine();
+  const Arm64SystemTargets arm64_targets = GetArm64SystemTargets();
   const fs::path dest32 = fs::path(GetSyswow64DirectoryPath()) / L"MoqiTextService.dll";
-  const fs::path dest64 = fs::path(GetNativeSystemDirectoryPath()) / L"MoqiTextService.dll";
-  const fs::path dest64_for_regsvr =
-      fs::path(GetNativeSystemDirectoryForChildProcess()) / L"MoqiTextService.dll";
+  const fs::path dest64 = is_arm64
+      ? arm64_targets.forwarder
+      : fs::path(GetNativeSystemDirectoryPath()) / L"MoqiTextService.dll";
+  const fs::path dest64_for_regsvr = is_arm64
+      ? arm64_targets.forwarder
+      : fs::path(GetNativeSystemDirectoryForChildProcess()) / L"MoqiTextService.dll";
   const fs::path regsvr32 = fs::path(GetSyswow64DirectoryPath()) / L"regsvr32.exe";
-  const fs::path regsvr64 = fs::path(GetNativeSystemDirectoryPath()) / L"regsvr32.exe";
+  const fs::path regsvr64 = is_arm64
+      ? arm64_targets.regsvr32
+      : fs::path(GetNativeSystemDirectoryPath()) / L"regsvr32.exe";
 
   DeleteReregisterTask();
   DeleteLauncherAutostartTask();
   RunRegsvr(regsvr32, dest32, app_dir, true);
-  RunRegsvr(regsvr64, dest64_for_regsvr, app_dir, true);
+  if (is_arm64) {
+    Wow64FsRedirectionScope redirection_scope;
+    if (redirection_scope.disabled()) {
+      RunRegsvr(regsvr64, dest64_for_regsvr, app_dir, true);
+    }
+  } else {
+    RunRegsvr(regsvr64, dest64_for_regsvr, app_dir, true);
+  }
 
   bool reboot_required = false;
   if (!DeleteFileWithFallback(dest32, reboot_required)) {
     return ShowFailureAndReturn(
         L"Failed to remove Win32 TSF DLL from " + dest32.wstring(), options.silent);
   }
-  if (!DeleteFileWithFallback(dest64, reboot_required)) {
+  if (is_arm64) {
+    Wow64FsRedirectionScope redirection_scope;
+    if (!redirection_scope.disabled()) {
+      return ShowFailureAndReturn(L"Failed to disable WOW64 file system "
+                                  L"redirection for ARM64 cleanup.",
+                                  options.silent);
+    }
+    if (!DeleteFileWithFallback(arm64_targets.forwarder, reboot_required)) {
+      return ShowFailureAndReturn(
+          L"Failed to remove ARM64 TSF forwarder from " +
+              arm64_targets.forwarder.wstring(),
+          options.silent);
+    }
+    DeleteFileWithFallback(arm64_targets.native_dll, reboot_required);
+    DeleteFileWithFallback(arm64_targets.x64_dll, reboot_required);
+  } else if (!DeleteFileWithFallback(dest64, reboot_required)) {
     return ShowFailureAndReturn(
         L"Failed to remove x64 TSF DLL from " + dest64.wstring(), options.silent);
   }

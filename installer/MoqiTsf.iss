@@ -1,12 +1,18 @@
-; Moqi IM for Windows — Inno Setup 6 wizard (x64 only).
-; Build: install Inno Setup 6, then run build-installer.ps1 -StageDir <stage root>
+; Moqi IM for Windows — Inno Setup 6 wizard (x64 + ARM64).
+; Build: install Inno Setup 6.3+ (ARM64 support), then run build-installer.ps1
+; -StageDir <stage root>. When the stage contains the ARM64 payload, the
+; builder passes /DMOQI_ARM64 and this script ships the ARM64 files too.
 ; AppId / IME CLSID: keep stable across releases (ARP upgrade path).
 
 #define MyAppName "墨奇输入法"
 #define MyAppPublisher "Moqi"
 #define MyAppURL "https://github.com/gaboolic/moqi-im-windows"
 #define MyAppId "{{C7A6A2D5-16C7-4BE4-8F52-E96D6D6A9E42}"
-#define ImeClsid "{{8F204C91-2D7A-4B3E-9E1F-6A5C0D8B2E7F}}"
+; ImeClsid is used inside [Code] Pascal strings, where ISPP substitutes the
+; literal text: the value must be the plain single-brace CLSID form that
+; regsvr32 writes (StringFromCLSID), or the registry checks/deletes below
+; never match.
+#define ImeClsid "{8F204C91-2D7A-4B3E-9E1F-6A5C0D8B2E7F}"
 
 #ifndef StageDir
   #define StageDir "..\stage"
@@ -23,8 +29,15 @@ AppUpdatesURL={#MyAppURL}
 DefaultDirName={autopf32}\MoqiIM
 DisableProgramGroupPage=yes
 PrivilegesRequired=admin
+#ifdef MOQI_ARM64
+ArchitecturesAllowed=x64 arm64
+ArchitecturesInstallIn64BitMode=x64 arm64
+#else
+; Without the ARM64 payload the installer cannot register a native TSF DLL,
+; so refuse to run on ARM64 hosts.
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
+#endif
 CloseApplications=yes
 RestartApplications=no
 WizardStyle=modern
@@ -40,7 +53,17 @@ DisableWelcomePage=no
 Name: "chinesesimplified"; MessagesFile: ".\Inno-Setup-Chinese-Simplified-Translation\ChineseSimplified.isl"
 
 [Files]
-Source: "{#StageDir}\win32\MoqiIM\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; arm64\ and the architecture-split server are released by their own entries
+; below, so keep them out of the catch-all payload copy.
+Source: "{#StageDir}\win32\MoqiIM\*"; DestDir: "{app}"; Excludes: "arm64\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+#ifdef MOQI_ARM64
+; x64/x86 machines get the amd64 backend; ARM64 machines get the arm64 one.
+Source: "{#StageDir}\server-amd64.exe"; DestDir: "{app}\moqi-ime"; DestName: "server.exe"; Check: NotArm64Host; Flags: ignoreversion
+Source: "{#StageDir}\server-arm64.exe"; DestDir: "{app}\moqi-ime"; DestName: "server.exe"; Check: IsArm64Host; Flags: ignoreversion
+; ARM64X forwarder + ARM64 native TSF DLL, deployed by SetupHelper into System32.
+Source: "{#StageDir}\win32\MoqiIM\arm64\MoqiTextService.dll"; DestDir: "{app}\arm64"; Check: IsArm64Host; Flags: ignoreversion
+Source: "{#StageDir}\win32\MoqiIM\arm64\MoqiTextServiceARM64X.dll"; DestDir: "{app}\arm64"; Check: IsArm64Host; Flags: ignoreversion
+#endif
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}\Uninstall"; Filename: "{uninstallexe}"
@@ -58,6 +81,7 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
 [InstallDelete]
 Type: filesandordirs; Name: "{app}\moqi-ime"
 Type: filesandordirs; Name: "{app}\x64"
+Type: filesandordirs; Name: "{app}\arm64"
 
 [Code]
 const
@@ -69,6 +93,16 @@ var
   HelperInstallNeedsRestart: Boolean;
   HelperUninstallNeedsRestart: Boolean;
   HadExistingInstall: Boolean;
+
+function IsArm64Host(): Boolean;
+begin
+  Result := IsARM64;
+end;
+
+function NotArm64Host(): Boolean;
+begin
+  Result := not IsARM64;
+end;
 
 function ExistingImeInstallationPresent: Boolean;
 begin

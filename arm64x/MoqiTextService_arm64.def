@@ -1,0 +1,12 @@
+; Export forwarding table for the ARM64 native side of MoqiTextServiceARM64X.dll.
+; On ARM64 Windows, System32\MoqiTextService.dll is an ARM64X forwarder DLL:
+; ARM64 native processes get forwarded to MoqiTextServiceARM64.dll, while x64
+; emulation processes get forwarded to MoqiTextServiceX64.dll (see
+; MoqiTextService_x64.def). Only the forwarder itself is registered with the
+; native ARM64 regsvr32.exe.
+
+EXPORTS
+    DllGetClassObject = MoqiTextServiceARM64.dll.DllGetClassObject
+    DllCanUnloadNow   = MoqiTextServiceARM64.dll.DllCanUnloadNow
+    DllRegisterServer = MoqiTextServiceARM64.dll.DllRegisterServer
+    DllUnregisterServer = MoqiTextServiceARM64.dll.DllUnregisterServer

@@ -15,6 +15,12 @@
 #include "../libIME2/src/DebugLogFile.h"
 #include "../libIME2/src/Utils.h"
 
+namespace Moqi {
+// defined in MoqiImeModule.cpp; must stay in sync with the installer's
+// InprocServer32 registry cleanup.
+extern const GUID g_textServiceClsid;
+}
+
 namespace {
 
 bool endsWithCaseInsensitive(const std::wstring& value, const wchar_t* suffix) {
@@ -208,6 +214,41 @@ static inline Ime::LangProfileInfo langProfileFromJson(std::wstring file, std::s
 	return Ime::LangProfileInfo();
 }
 
+#ifdef _M_ARM64
+// On ARM64, System32\MoqiTextService.dll is an ARM64X forwarder DLL. When the
+// native ARM64 regsvr32 registers it, DllRegisterServer actually executes in
+// MoqiTextServiceARM64.dll, so libIME2's GetModuleFileName-based
+// InprocServer32 value would point at the forwarded DLL and x64 emulation
+// processes could no longer load the IME. Rewrite the value to the forwarder.
+HRESULT rewriteInprocServer32ToArm64xForwarder() {
+	wchar_t modulePath[MAX_PATH] = {};
+	DWORD modulePathLen = ::GetModuleFileNameW(g_dllModule, modulePath, _countof(modulePath));
+	if (modulePathLen == 0 || modulePathLen >= _countof(modulePath)) {
+		return E_FAIL;
+	}
+	wchar_t* lastSlash = wcsrchr(modulePath, L'\\');
+	if (!lastSlash) {
+		return E_FAIL;
+	}
+	static const wchar_t forwarderName[] = L"MoqiTextService.dll";
+	if (FAILED(StringCchCopyW(lastSlash + 1, _countof(modulePath) - (lastSlash + 1 - modulePath), forwarderName))) {
+		return E_FAIL;
+	}
+	if (::GetFileAttributesW(modulePath) == INVALID_FILE_ATTRIBUTES) {
+		return E_FAIL;
+	}
+	LPOLESTR clsidStr = nullptr;
+	if (FAILED(::StringFromCLSID(Moqi::g_textServiceClsid, &clsidStr))) {
+		return E_FAIL;
+	}
+	std::wstring regPath = std::wstring(L"CLSID\\") + clsidStr + L"\\InprocServer32";
+	::CoTaskMemFree(clsidStr);
+	LONG result = ::RegSetKeyValueW(HKEY_CLASSES_ROOT, regPath.c_str(), nullptr,
+		REG_SZ, modulePath, (lstrlenW(modulePath) + 1) * sizeof(wchar_t));
+	return result == ERROR_SUCCESS ? S_OK : E_FAIL;
+}
+#endif  // _M_ARM64
+
 STDAPI DllRegisterServer(void) {
 	Moqi::ImeModule* imeModule = getOrCreateImeModule();
 	if (imeModule == nullptr) {
@@ -252,5 +293,11 @@ STDAPI DllRegisterServer(void) {
 			::FindClose(hFind);
 		}
 	}
-	return imeModule->registerServer(L"MoqiTextService", langProfiles.data(), langProfiles.size());
+	HRESULT hr = imeModule->registerServer(L"MoqiTextService", langProfiles.data(), langProfiles.size());
+#ifdef _M_ARM64
+	if (SUCCEEDED(hr)) {
+		hr = rewriteInprocServer32ToArm64xForwarder();
+	}
+#endif
+	return hr;
 }

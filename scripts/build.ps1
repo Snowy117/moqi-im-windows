@@ -1,7 +1,14 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  Build Win32 and x64 Moqi IM for Windows binaries with CMake.
+  Build Win32, x64, and ARM64 Moqi IM for Windows binaries with CMake.
+
+.DESCRIPTION
+  Win32 builds the full solution (MoqiLauncher.exe, SetupHelper.exe, and the
+  x86 MoqiTextService.dll). x64 and ARM64 build MoqiTextService.dll only,
+  which is all a TSF IME needs on those architectures. The ARM64 pass also
+  links MoqiTextServiceARM64X.dll, the ARM64X forwarder DLL that dispatches
+  to the ARM64 and x64 builds on Windows ARM64 (see arm64x\).
 
 .PARAMETER RepoRoot
   Root of moqi-im-windows (defaults to the parent directory of this script).
@@ -11,6 +18,13 @@
 
 .PARAMETER X64BuildDir
   CMake x64 build directory (default: RepoRoot\build-vs64).
+
+.PARAMETER Arm64BuildDir
+  CMake ARM64 build directory (default: RepoRoot\build-vsarm64).
+
+.PARAMETER SkipArm64
+  Skip the ARM64 build and the ARM64X forwarder DLL (for hosts without the
+  VS 2022 ARM64 build tools).
 
 .PARAMETER Configuration
   Build configuration (default: Release).
@@ -28,6 +42,8 @@ param(
   [string] $RepoRoot = "",
   [string] $Win32BuildDir = "",
   [string] $X64BuildDir = "",
+  [string] $Arm64BuildDir = "",
+  [switch] $SkipArm64,
   [string] $Configuration = "Release",
   [string] $Generator = "Visual Studio 17 2022",
   [string] $ProtobufRoot = "",
@@ -121,8 +137,10 @@ $RepoRoot = [System.IO.Path]::GetFullPath($RepoRoot)
 
 if (-not $Win32BuildDir) { $Win32BuildDir = Join-Path $RepoRoot "build-vs32" }
 if (-not $X64BuildDir) { $X64BuildDir = Join-Path $RepoRoot "build-vs64" }
+if (-not $Arm64BuildDir) { $Arm64BuildDir = Join-Path $RepoRoot "build-vsarm64" }
 $Win32BuildDir = [System.IO.Path]::GetFullPath($Win32BuildDir)
 $X64BuildDir = [System.IO.Path]::GetFullPath($X64BuildDir)
+$Arm64BuildDir = [System.IO.Path]::GetFullPath($Arm64BuildDir)
 $ProtobufRoot = Resolve-ProtobufRoot -RequestedPath $ProtobufRoot
 $ProtobufSourceDir = Resolve-ProtobufSourceDir -RequestedPath $ProtobufSourceDir -RepoRoot $RepoRoot
 
@@ -163,4 +181,37 @@ Invoke-Step -FilePath "cmake" -ArgumentList @(
   "--target", "MoqiTextService"
 )
 
-Write-Host "OK: Win32 $Configuration (full solution), x64 $Configuration (MoqiTextService)."
+if (-not $SkipArm64) {
+  $arm64ConfigureArgs = $commonConfigureArgs + @(
+    "-B", $Arm64BuildDir,
+    "-G", $Generator,
+    "-A", "ARM64"
+  )
+  Invoke-Step -FilePath "cmake" -ArgumentList $arm64ConfigureArgs
+  Invoke-Step -FilePath "cmake" -ArgumentList @(
+    "--build", $Arm64BuildDir,
+    "--config", $Configuration,
+    "--target", "MoqiTextService"
+  )
+
+  $arm64xDll = Join-Path $Arm64BuildDir "MoqiTextServiceARM64X.dll"
+  $arm64xScript = Join-Path $RepoRoot "arm64x\build-arm64x.ps1"
+  if (-not (Test-Path -LiteralPath $arm64xScript)) {
+    throw "ARM64X build script not found: $arm64xScript"
+  }
+  Invoke-Step -FilePath "powershell.exe" -ArgumentList @(
+    "-NoProfile",
+    "-ExecutionPolicy", "Bypass",
+    "-File", "`"$arm64xScript`"",
+    "-OutputDir", "`"$Arm64BuildDir`""
+  )
+  if (-not (Test-Path -LiteralPath $arm64xDll)) {
+    throw "ARM64X forwarder DLL was not produced: $arm64xDll"
+  }
+}
+
+if ($SkipArm64) {
+  Write-Host "OK: Win32 $Configuration (full solution), x64 $Configuration (MoqiTextService). ARM64 skipped."
+} else {
+  Write-Host "OK: Win32 $Configuration (full solution), x64/ARM64 $Configuration (MoqiTextService), ARM64X forwarder."
+}

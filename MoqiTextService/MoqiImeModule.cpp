@@ -32,7 +32,9 @@ namespace Moqi {
 
 // CLSID of Moqi Text Service (must stay in sync with installer/registration
 // cleanup) {8F204C91-2D7A-4B3E-9E1F-6A5C0D8B2E7F}
-const GUID g_textServiceClsid = {
+// extern is required: namespace-scope const defaults to internal linkage,
+// which would leave DllEntry.cpp's ARM64 registration fixup unresolved.
+extern const GUID g_textServiceClsid = {
     0x8f204c91,
     0x2d7a,
     0x4b3e,

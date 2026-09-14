@@ -3,10 +3,18 @@
 .SYNOPSIS
   Compile MoqiTsf.iss with Inno Setup 6 (requires ISCC.exe on PATH or default path).
 
+.DESCRIPTION
+  Requires Inno Setup 6.3 or newer for ARM64 support (ArchitecturesAllowed /
+  IsARM64). When the staged tree contains the ARM64 payload (arm64\
+  MoqiTextService.dll plus the architecture-split server-*.exe files), the
+  MOQI_ARM64 define is passed to ISCC so the installer ships the ARM64 files.
+
 .PARAMETER StageDir
   Root of the staged installer tree. Expected layout:
     win32\MoqiIM\...
     x64\MoqiIM\...
+    win32\MoqiIM\arm64\...          (optional, enables MOQI_ARM64)
+    server-amd64.exe, server-arm64.exe   (optional, MOQI_ARM64 mode)
 
 .PARAMETER IssPath
   Optional path to MoqiTsf.iss (default: installer dir next to this script).
@@ -49,6 +57,19 @@ foreach ($path in $requiredPaths) {
     }
 }
 
+$arm64Payload = $true
+foreach ($path in @(
+    (Join-Path $win32Root 'arm64\MoqiTextService.dll'),
+    (Join-Path $win32Root 'arm64\MoqiTextServiceARM64X.dll'),
+    (Join-Path $StageDir 'server-amd64.exe'),
+    (Join-Path $StageDir 'server-arm64.exe')
+)) {
+    if (-not (Test-Path -LiteralPath $path)) {
+        $arm64Payload = $false
+        break
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($IssPath)) {
     $IssPath = Join-Path $PSScriptRoot 'MoqiTsf.iss'
 }
@@ -80,10 +101,19 @@ Then re-run this script.
 "@
 }
 
-$argStage = '/DStageDir=' + $StageDir
+# Start-Process joins ArgumentList with spaces without quoting, so paths with
+# spaces must be quoted explicitly.
+$argStage = '"/DStageDir=' + $StageDir + '"'
+$isccArgs = @("`"$IssPath`"", $argStage)
+if ($arm64Payload) {
+    Write-Host 'ARM64 payload detected; enabling MOQI_ARM64 define.'
+    $isccArgs += '/DMOQI_ARM64'
+} else {
+    Write-Host 'ARM64 payload not staged; building x64/x86-only installer.'
+}
 Write-Host "ISCC: $iscc"
-Write-Host "Args: `"$IssPath`" $argStage"
-$p = Start-Process -FilePath $iscc -ArgumentList @("`"$IssPath`"", $argStage) -Wait -PassThru -NoNewWindow
+Write-Host "Args: $($isccArgs -join ' ')"
+$p = Start-Process -FilePath $iscc -ArgumentList $isccArgs -Wait -PassThru -NoNewWindow
 if ($p.ExitCode -ne 0) {
     Write-Error "ISCC failed with exit code $($p.ExitCode)"
 }
