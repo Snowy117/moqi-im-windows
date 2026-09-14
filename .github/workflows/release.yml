@@ -69,10 +69,19 @@ jobs:
         run: |
           choco install innosetup --yes --no-progress
           # ARM64 keywords (ArchitecturesAllowed=arm64, IsARM64) need Inno 6.3+.
-          $iscc = Get-Item "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue
-          if (-not $iscc -or [version]$iscc.VersionInfo.ProductVersion -lt [version]'6.3') {
-            throw "Inno Setup 6.3+ required, found: $($iscc.VersionInfo.ProductVersion)"
+          # ISCC.exe ships without a usable ProductVersion resource, so verify
+          # through the chocolatey package database instead.
+          $ErrorActionPreference = 'Continue'
+          $listOutput = (choco list innosetup 2>$null) -join ' '
+          if ($listOutput -notmatch 'innosetup\s+(\d+)\.(\d+)') {
+            throw "Cannot determine installed Inno Setup version: $listOutput"
           }
+          $major = [int]$Matches[1]; $minor = [int]$Matches[2]
+          if (($major -lt 6) -or ($major -eq 6 -and $minor -lt 3)) {
+            throw "Inno Setup 6.3+ required, found $major.$minor"
+          }
+          Write-Host "Inno Setup $major.$minor OK"
+          exit 0
 
       - name: Download protoc
         run: |
