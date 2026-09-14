@@ -154,36 +154,147 @@ if (-not (Test-Path -LiteralPath (Join-Path $moqiImeBuildDir "server.exe"))) {
 }
 Move-Item -LiteralPath $moqiImeBuildDir -Destination $moqiImeAmd64Dir
 
+function Write-MoqiServerVersionInfo {
+    param(
+        [string] $VersionInfoPath,
+        [string] $IconPath
+    )
+
+    # Mirrors moqi-ime scripts/build.ps1 Write-ServerVersionInfo so both
+    # server.exe architectures carry the same version resource.
+    $fileDescription = ([char]0x58A8).ToString() + ([char]0x5947) + ([char]0x8F93) + ([char]0x5165) + ([char]0x6CD5) + ([char]0x5F15) + ([char]0x64CE) + ([char]0x670D) + ([char]0x52A1)
+    $productName = ([char]0x58A8).ToString() + ([char]0x5947) + ([char]0x8F93) + ([char]0x5165) + ([char]0x6CD5)
+
+    $versionInfo = [ordered]@{
+        FixedFileInfo  = [ordered]@{
+            FileVersion    = [ordered]@{
+                Major = 1
+                Minor = 0
+                Patch = 0
+                Build = 0
+            }
+            ProductVersion = [ordered]@{
+                Major = 1
+                Minor = 0
+                Patch = 0
+                Build = 0
+            }
+            FileFlagsMask  = "3f"
+            FileFlags      = "00"
+            FileOS         = "040004"
+            FileType       = "01"
+            FileSubType    = "00"
+        }
+        StringFileInfo = [ordered]@{
+            Comments         = ""
+            CompanyName      = ""
+            FileDescription  = $fileDescription
+            FileVersion      = "1.0.0.0"
+            InternalName     = "server.exe"
+            LegalCopyright   = ""
+            LegalTrademarks  = ""
+            OriginalFilename = "server.exe"
+            PrivateBuild     = ""
+            ProductName      = $productName
+            ProductVersion   = "1.0.0.0"
+            SpecialBuild     = ""
+        }
+        VarFileInfo    = [ordered]@{
+            Translation = [ordered]@{
+                LangID    = "0804"
+                CharsetID = "04B0"
+            }
+        }
+        IconPath       = $IconPath
+        ManifestPath   = ""
+    }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText(
+        $VersionInfoPath,
+        ($versionInfo | ConvertTo-Json -Depth 6),
+        $utf8NoBom
+    )
+}
+
+function Resolve-Goversioninfo {
+    $command = Get-Command "goversioninfo" -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
+    }
+
+    $goBin = (& go env GOBIN).Trim()
+    if (-not $goBin) {
+        $goPath = (& go env GOPATH).Trim()
+        if (-not $goPath) {
+            throw "Unable to resolve GOPATH for the goversioninfo tool."
+        }
+        $goBin = Join-Path ($goPath.Split([System.IO.Path]::PathSeparator)[0]) "bin"
+    }
+    $candidate = Join-Path $goBin "goversioninfo.exe"
+    if (Test-Path -LiteralPath $candidate) {
+        return $candidate
+    }
+
+    Invoke-Step -FilePath "go" -ArgumentList @(
+        "install", "github.com/josephspurrier/goversioninfo/cmd/goversioninfo@latest"
+    )
+    if (-not (Test-Path -LiteralPath $candidate)) {
+        throw "goversioninfo was not installed to $goBin"
+    }
+    return $candidate
+}
+
 if (-not $SkipArm64) {
+    # moqi-ime's build.ps1 hardcodes GOARCH=amd64, so cross-compile the ARM64
+    # server.exe here instead of invoking the script a second time. Only
+    # server.exe is architecture-specific; install.ps1 takes everything else
+    # from the amd64 package, so this directory needs the exe alone.
+    New-Item -ItemType Directory -Path $moqiImeArm64Dir -Force | Out-Null
+    $arm64ServerExe = Join-Path $moqiImeArm64Dir "server.exe"
+
+    $serverIcon = Join-Path $MoqiImeRoot "icons\mo.ico"
+    if (-not (Test-Path -LiteralPath $serverIcon)) {
+        throw "Missing moqi-ime server icon: $serverIcon"
+    }
+
+    $arm64BuildDir = Join-Path $MoqiImeRoot "scripts\build\arm64-cross"
+    New-Item -ItemType Directory -Path $arm64BuildDir -Force | Out-Null
+    $versionInfoPath = Join-Path $arm64BuildDir "server.versioninfo.json"
+    # The $GOARCH suffix in the name makes go build pick the resource up only
+    # for the ARM64 pass, mirroring moqi-ime's resource_windows_amd64.syso.
+    $sysoPath = Join-Path $MoqiImeRoot "resource_windows_arm64.syso"
+
+    Write-MoqiServerVersionInfo -VersionInfoPath $versionInfoPath -IconPath $serverIcon
+    $goversioninfo = Resolve-Goversioninfo
+    Invoke-Step -FilePath $goversioninfo -ArgumentList @(
+        "-64", "-o", $sysoPath, $versionInfoPath
+    ) -WorkingDirectory $MoqiImeRoot
+
+    $previousGoos = $env:GOOS
     $previousGoarch = $env:GOARCH
+    $previousCgoEnabled = $env:CGO_ENABLED
+    $env:GOOS = "windows"
     $env:GOARCH = "arm64"
+    $env:CGO_ENABLED = "0"
     try {
-        Invoke-Step -FilePath "powershell.exe" -ArgumentList @(
-            "-NoProfile",
-            "-ExecutionPolicy", "Bypass",
-            "-File", "`"$moqiImeBuildScript`"",
-            "-RepoRoot", "`"$MoqiImeRoot`""
+        Invoke-Step -FilePath "go" -ArgumentList @(
+            "build", "-ldflags", "-s -w", "-o", $arm64ServerExe, "."
         ) -WorkingDirectory $MoqiImeRoot
     }
     finally {
-        if ($null -ne $previousGoarch) {
-            $env:GOARCH = $previousGoarch
-        } else {
-            Remove-Item -LiteralPath 'env:GOARCH' -ErrorAction SilentlyContinue
-        }
+        Remove-Item -LiteralPath $sysoPath -Force -ErrorAction SilentlyContinue
+        if ($null -ne $previousGoos) { $env:GOOS = $previousGoos } else { Remove-Item -LiteralPath 'env:GOOS' -ErrorAction SilentlyContinue }
+        if ($null -ne $previousGoarch) { $env:GOARCH = $previousGoarch } else { Remove-Item -LiteralPath 'env:GOARCH' -ErrorAction SilentlyContinue }
+        if ($null -ne $previousCgoEnabled) { $env:CGO_ENABLED = $previousCgoEnabled } else { Remove-Item -LiteralPath 'env:CGO_ENABLED' -ErrorAction SilentlyContinue }
     }
 
-    $arm64Server = Join-Path $moqiImeBuildDir "server.exe"
-    if (-not (Test-Path -LiteralPath $arm64Server)) {
-        throw "ARM64 moqi-ime runtime was not produced: $moqiImeBuildDir"
-    }
-    $serverBytes = [System.IO.File]::ReadAllBytes($arm64Server)
+    $serverBytes = [System.IO.File]::ReadAllBytes($arm64ServerExe)
     $peOffset = [BitConverter]::ToInt32($serverBytes, 0x3C)
     $serverMachine = [BitConverter]::ToUInt16($serverBytes, $peOffset + 4)
     if ($serverMachine -ne 0xAA64) {
-        throw ("ARM64 moqi-ime server.exe has unexpected PE machine type 0x{0:X4} (expected 0xAA64); does moqi-ime's build script honor GOARCH?" -f $serverMachine)
+        throw ("ARM64 server.exe has unexpected PE machine type 0x{0:X4} (expected 0xAA64)." -f $serverMachine)
     }
-    Move-Item -LiteralPath $moqiImeBuildDir -Destination $moqiImeArm64Dir
 }
 
 $moqiImeRuntimeDir = $moqiImeAmd64Dir
