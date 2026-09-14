@@ -267,9 +267,6 @@ if (-not $SkipArm64) {
 
     Write-MoqiServerVersionInfo -VersionInfoPath $versionInfoPath -IconPath $serverIcon
     $goversioninfo = Resolve-Goversioninfo
-    Invoke-Step -FilePath $goversioninfo -ArgumentList @(
-        "-64", "-o", $sysoPath, $versionInfoPath
-    ) -WorkingDirectory $MoqiImeRoot
 
     $previousGoos = $env:GOOS
     $previousGoarch = $env:GOARCH
@@ -278,6 +275,14 @@ if (-not $SkipArm64) {
     $env:GOARCH = "arm64"
     $env:CGO_ENABLED = "0"
     try {
+        # goversioninfo needs both -64 and -arm to emit an ARM64 COFF object;
+        # with only -64 it writes AMD64 relocations that the ARM64 Go linker
+        # rejects (goversioninfo >= 1.6.0 also derives both from GOARCH, which
+        # is set above as a belt-and-braces default).
+        Invoke-Step -FilePath $goversioninfo -ArgumentList @(
+            "-64", "-arm", "-o", $sysoPath, $versionInfoPath
+        ) -WorkingDirectory $MoqiImeRoot
+
         Invoke-Step -FilePath "go" -ArgumentList @(
             "build", "-ldflags", "-s -w", "-o", $arm64ServerExe, "."
         ) -WorkingDirectory $MoqiImeRoot
