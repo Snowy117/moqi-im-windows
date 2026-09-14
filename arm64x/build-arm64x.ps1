@@ -103,6 +103,38 @@ foreach ($required in @($cl, $link, $lib, $arm64Def, $x64Def, $dummy)) {
     }
 }
 
+function Resolve-WindowsSdkLibPaths {
+    # link.exe needs the Windows SDK's arm64ec import libraries (vcruntime /
+    # kernel32 provide __os_arm64x_dispatch_icall for the EC thunks). This
+    # script runs outside vcvars, so locate the SDK explicitly.
+    $kitsRoot = "${env:ProgramFiles(x86)}\Windows Kits\10\Lib"
+    if (-not (Test-Path -LiteralPath $kitsRoot)) {
+        throw "Windows SDK library root not found: $kitsRoot"
+    }
+
+    $sdkVersion = Get-ChildItem -Path $kitsRoot -Directory |
+        Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+        Sort-Object { [version]$_.Name } -Descending |
+        Select-Object -First 1
+    if (-not $sdkVersion) {
+        throw "No versioned Windows SDK found under $kitsRoot"
+    }
+
+    $umArm64ec = Join-Path $sdkVersion.FullName "um\arm64ec"
+    $ucrtArm64ec = Join-Path $sdkVersion.FullName "ucrt\arm64ec"
+    $umArm64 = Join-Path $sdkVersion.FullName "um\arm64"
+    $ucrtArm64 = Join-Path $sdkVersion.FullName "ucrt\arm64"
+    foreach ($dir in @($umArm64ec, $ucrtArm64ec, $umArm64, $ucrtArm64)) {
+        if (-not (Test-Path -LiteralPath $dir)) {
+            throw "Windows SDK arm64/arm64ec libraries not found: $dir (install the ARM64 EC libraries via the Windows SDK setup)"
+        }
+    }
+    Write-Host "Windows SDK: $($sdkVersion.Name)"
+    return @($umArm64ec, $ucrtArm64ec, $umArm64, $ucrtArm64)
+}
+
+$sdkLibPaths = Resolve-WindowsSdkLibPaths
+
 $workDir = Join-Path $OutputDir "obj"
 New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 
@@ -131,11 +163,11 @@ Invoke-Tool -FilePath $lib -ArgumentList @(
 ) -WorkingDirectory $workDir
 
 $outDll = Join-Path $OutputDir "MoqiTextServiceARM64X.dll"
-# /nodefaultlib: the forwarder contains only linker-generated thunks and no
-# CRT dependency, and this script runs outside vcvars where libcmt.lib would
-# not be found.
-Invoke-Tool -FilePath $link -ArgumentList @(
-    "/dll", "/noentry", "/nodefaultlib", "/machine:arm64x",
+# The EC thunks reference __os_arm64x_dispatch_icall from the SDK's arm64ec
+# import libraries, so keep the default libraries and add the SDK lib paths
+# explicitly (this script runs outside vcvars).
+$linkArgs = @(
+    "/dll", "/noentry", "/machine:arm64x",
     "/defArm64Native:$arm64Def",
     "/def:$x64Def",
     "/out:$outDll",
@@ -144,7 +176,11 @@ Invoke-Tool -FilePath $link -ArgumentList @(
     (Join-Path $workDir 'MoqiTextService_x64.lib'),
     (Join-Path $workDir 'MoqiTextService_arm64.lib'),
     "/ignore:4104"
-) -WorkingDirectory $workDir
+)
+foreach ($libPath in $sdkLibPaths) {
+    $linkArgs += "/libpath:$libPath"
+}
+Invoke-Tool -FilePath $link -ArgumentList $linkArgs -WorkingDirectory $workDir
 
 if (-not (Test-Path -LiteralPath $outDll)) {
     throw "ARM64X forwarder DLL was not produced: $outDll"
